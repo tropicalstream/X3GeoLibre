@@ -1,0 +1,83 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <!-- ChatGPT voice chat: WebRTC getUserMedia needs the mic, and it must keep
+         capturing while the glasses' display sleeps (onPause), so the playback
+         foreground service is typed microphone + mediaPlayback. -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+
+    <uses-feature android:name="android.hardware.microphone" android:required="true" />
+
+    <application
+        android:allowBackup="false"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:label="@string/app_name"
+        android:hardwareAccelerated="true"
+        android:usesCleartextTraffic="true"
+        android:theme="@style/Theme.X3GeoLibre">
+
+        <!-- RayNeo Mercury launcher integration (dual projection / AR app). -->
+        <meta-data android:name="com.rayneo.mercury.app" android:value="true" />
+
+        <!-- adb-pushable Groq key (see SetKeyReceiver kdoc / README). -->
+        <receiver
+            android:name=".SetKeyReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.x3geolibre.app.SET_GROQ_KEY" />
+            </intent-filter>
+        </receiver>
+
+        <service
+            android:name=".GeoPlaybackService"
+            android:exported="false"
+            android:foregroundServiceType="microphone|mediaPlayback" />
+
+        <!-- Legacy Chrome-95 WebView build; kept as a fallback, launchable via
+             adb: am start -n com.x3geolibre.app/.MainActivity -->
+        <activity
+            android:name=".MainActivity"
+            android:configChanges="orientation|screenSize|keyboardHidden|screenLayout|smallestScreenSize|uiMode|density"
+            android:exported="true"
+            android:hardwareAccelerated="true"
+            android:launchMode="singleTask"
+            android:theme="@style/Theme.X3GeoLibre"
+            android:windowSoftInputMode="stateAlwaysHidden|adjustNothing" />
+
+        <!-- Primary app: bundled GeckoView (Firefox 152) engine. -->
+        <activity
+            android:name=".GeckoTestActivity"
+            android:configChanges="orientation|screenSize|keyboardHidden|screenLayout|smallestScreenSize|uiMode|density"
+            android:exported="true"
+            android:hardwareAccelerated="true"
+            android:launchMode="singleTask"
+            android:screenOrientation="landscape"
+            android:theme="@style/Theme.X3GeoLibre"
+            android:windowSoftInputMode="stateAlwaysHidden|adjustNothing">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+                <!-- RayNeo AR launcher category (mirrors TapInsight/TapLinkX3). -->
+                <category android:name="com.rayneo.intent.category.AR_APP" />
+            </intent-filter>
+        </activity>
+
+        <!-- Diagnostic: about:webrtc viewer (launched via adb). -->
+        <activity
+            android:name=".WebRtcStatsActivity"
+            android:exported="true"
+            android:hardwareAccelerated="true"
+            android:theme="@style/Theme.X3GeoLibre" />
+    </application>
+</manifest>

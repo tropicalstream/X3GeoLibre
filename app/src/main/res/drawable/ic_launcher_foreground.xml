@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Self-contained adaptive-icon foreground: a white speech bubble on the
+     transparent foreground layer (the green launcher background shows through).
+     108x108 viewport with the standard ~18dp safe-zone padding. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M34,30h40c5.52,0 10,4.48 10,10v22c0,5.52 -4.48,10 -10,10H52l-14,12v-12h-4c-5.52,0 -10,-4.48 -10,-10V40c0,-5.52 4.48,-10 10,-10z" />
+    <path
+        android:fillColor="#10A37F"
+        android:pathData="M42,49m-3.5,0a3.5,3.5 0,1 1,7 0a3.5,3.5 0,1 1,-7 0" />
+    <path
+        android:fillColor="#10A37F"
+        android:pathData="M54,49m-3.5,0a3.5,3.5 0,1 1,7 0a3.5,3.5 0,1 1,-7 0" />
+    <path
+        android:fillColor="#10A37F"
+        android:pathData="M66,49m-3.5,0a3.5,3.5 0,1 1,7 0a3.5,3.5 0,1 1,-7 0" />
+</vector>

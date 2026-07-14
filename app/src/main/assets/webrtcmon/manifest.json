@@ -1,0 +1,17 @@
+{
+  "manifest_version": 2,
+  "name": "wrtcmon",
+  "version": "1.4",
+  "description": "TapGPT WebRTC/WebSocket connection monitor (diagnostic).",
+  "browser_specific_settings": { "gecko": { "id": "wrtcmon@tapgpt.app" } },
+  "permissions": ["nativeMessaging"],
+  "background": { "scripts": ["background.js"] },
+  "content_scripts": [
+    {
+      "matches": ["*://*.chatgpt.com/*", "*://*.openai.com/*", "*://*.oaiusercontent.com/*"],
+      "js": ["monitor.js"],
+      "run_at": "document_start",
+      "all_frames": true
+    }
+  ]
+}
