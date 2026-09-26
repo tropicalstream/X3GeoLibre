@@ -32,31 +32,55 @@ import org.mozilla.geckoview.WebExtension
  *   adb shell am start -n com.x3geolibre.app/.GeckoTestActivity
  */
 class GeckoTestActivity : Activity() {
+    // One live GeckoView (left eye), PixelCopy-mirrored to the right eye.
     private lateinit var session: GeckoSession
+    private lateinit var geckoView: GeckoView
     private lateinit var binocular: GeckoBinocularLayout
     private var inputConnection: InputConnection? = null
     private var dictation: GroqDictation? = null
+    private var geminiDictation: GeminiDictation? = null
+    /** Full-duplex voice loop (reads GeoLibre's answers aloud + hands-free replies). */
+    private var geminiLive: GeminiLiveSession? = null
+    /** Set while we're opening the assistant so assistant-ready can start Live. */
+    private var liveWanted = false
+    /** Transcript awaiting the page's prompt-focus ack before being typed. */
+    private var pendingQuery: String? = null
     private var keyReceiver: android.content.BroadcastReceiver? = null
 
     // ── x3geolibre bridge state ─────────────────────────────────────
     private var bridgePort: WebExtension.Port? = null
     @Volatile private var lastFix: IpLocator.Fix? = null
-    @Volatile private var pageLoadedOk = false
     @Volatile private var loadRequested = false
+    @Volatile private var ipLocateStarted = false
     private val ui = android.os.Handler(android.os.Looper.getMainLooper())
+    private var networkCallback: android.net.ConnectivityManager.NetworkCallback? = null
+    private val networkPoll = Runnable { loadWhenOnline() }
     private val wakeLock: PowerManager.WakeLock by lazy {
         (getSystemService(Context.POWER_SERVICE) as PowerManager)
             .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "X3GeoLibre:Gecko").apply { setReferenceCounted(false) }
     }
     private val wifiLock: WifiManager.WifiLock? by lazy {
         (applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager)?.run {
-            // LOW_LATENCY disables Wi-Fi power-save for real-time traffic — without it
-            // the radio naps and drops the WebRTC STUN keepalives, so the voice call
-            // dies at exactly WebRTC's 30s ICE consent-freshness timeout.
-            val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q)
-                WifiManager.WIFI_MODE_FULL_LOW_LATENCY
-            else @Suppress("DEPRECATION") WifiManager.WIFI_MODE_FULL_HIGH_PERF
-            createWifiLock(mode, "X3GeoLibre:Gecko").apply { setReferenceCounted(false) }
+            // WIFI_MODE_FULL, not HIGH_PERF: this app only fetches map tiles in
+            // bursts and does one-shot dictation uploads — nothing that needs the
+            // radio pinned out of power-save. HIGH_PERF held the PHY at full power
+            // continuously, a real chunk of the glasses' heat; FULL keeps Wi-Fi
+            // connected while letting it drop into power-save between fetches.
+            @Suppress("DEPRECATION")
+            createWifiLock(WifiManager.WIFI_MODE_FULL, "X3GeoLibre:Gecko")
+                .apply { setReferenceCounted(false) }
+        }
+    }
+
+    // HIGH_PERF lock held ONLY while a Live voice session is up: the long-lived
+    // voice WebSocket dies with "Software caused connection abort" when the radio
+    // drops into power-save between turns. Sessions are short and user-bounded,
+    // so this doesn't reintroduce the always-on heat the FULL lock avoided.
+    private val liveWifiLock: WifiManager.WifiLock? by lazy {
+        (applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager)?.run {
+            @Suppress("DEPRECATION")
+            createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "X3GeoLibre:Live")
+                .apply { setReferenceCounted(false) }
         }
     }
 
@@ -65,11 +89,12 @@ class GeckoTestActivity : Activity() {
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         enableImmersive()
 
-        // Keep the mic session alive + the process at max priority (a foreground
-        // microphone service + wakelocks) — without this the voice call gets
-        // throttled/revoked after a short window on these glasses.
+        // CPU/GPU wakelock only. The foreground microphone service is NOT started
+        // here anymore — running it continuously was a major heat source. Dictation
+        // is short and user-initiated, so the service is spun up on demand only for
+        // the seconds a recording is actually in flight (see startPlaybackService /
+        // stopPlaybackService wired into the dictation onState callbacks).
         acquireLocks()
-        startPlaybackService()
 
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
             != PackageManager.PERMISSION_GRANTED
@@ -79,61 +104,27 @@ class GeckoTestActivity : Activity() {
 
         val runtime = Gecko.runtime(this)
         setLowCpuVoicePrefs()
-        val settings = GeckoSessionSettings.Builder()
-            .userAgentMode(GeckoSessionSettings.USER_AGENT_MODE_DESKTOP)
-            .viewportMode(GeckoSessionSettings.VIEWPORT_MODE_DESKTOP)
-            .build()
-        session = GeckoSession(settings)
-        session.progressDelegate = object : GeckoSession.ProgressDelegate {
-            override fun onPageStop(s: GeckoSession, success: Boolean) {
-                Log.d(TAG, "onPageStop success=$success")
-                if (success) pageLoadedOk = true
-            }
-        }
-        session.contentDelegate = object : GeckoSession.ContentDelegate {
-            override fun onTitleChange(s: GeckoSession, title: String?) {
-                if (title != null && title.startsWith("WRTC|")) Log.d("X3GeoLibre-WRTC", title.removePrefix("WRTC|"))
-            }
-        }
-        session.permissionDelegate = object : GeckoSession.PermissionDelegate {
-            override fun onContentPermissionRequest(
-                s: GeckoSession,
-                perm: GeckoSession.PermissionDelegate.ContentPermission
-            ): org.mozilla.geckoview.GeckoResult<Int> {
-                // Grant content permissions (notably autoplay-audible, so ChatGPT's
-                // spoken voice reply plays).
-                return org.mozilla.geckoview.GeckoResult.fromValue(
-                    GeckoSession.PermissionDelegate.ContentPermission.VALUE_ALLOW
-                )
-            }
-
-            override fun onAndroidPermissionsRequest(
-                s: GeckoSession, permissions: Array<out String>?,
-                callback: GeckoSession.PermissionDelegate.Callback
-            ) { callback.grant() }
-            override fun onMediaPermissionRequest(
-                s: GeckoSession, uri: String,
-                video: Array<out GeckoSession.PermissionDelegate.MediaSource>?,
-                audio: Array<out GeckoSession.PermissionDelegate.MediaSource>?,
-                callback: GeckoSession.PermissionDelegate.MediaCallback
-            ) { callback.grant(null, audio?.firstOrNull()) }
-        }
-
-        val geckoView = GeckoView(this)
-        session.open(runtime)
+        session = newSession(runtime)
+        geckoView = GeckoView(this)
         geckoView.setSession(session)
 
         binocular = GeckoBinocularLayout(this, geckoView)
+        // Type via synthesized KeyEvents dispatched straight into the GeckoView —
+        // the InputConnection commitText path silently drops text here because we
+        // bypass the system IME, so Gecko never activates that connection. Key
+        // events are what `adb shell input text` uses, verified working on-device.
         binocular.textInput = object : GeckoBinocularLayout.TextInput {
-            override fun commit(text: String) { ic()?.commitText(text, 1) }
-            override fun backspace() { ic()?.deleteSurroundingText(1, 0) }
-            override fun enter() {
-                val c = ic() ?: return
-                c.sendKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_ENTER))
-                c.sendKeyEvent(KeyEvent(KeyEvent.ACTION_UP, KeyEvent.KEYCODE_ENTER))
+            override fun commit(text: String) { typeText(text) }
+            override fun backspace() { sendKey(KeyEvent.KEYCODE_DEL) }
+            override fun enter() { sendKey(KeyEvent.KEYCODE_ENTER) }
+            override fun clear() {
+                // Select-all + delete clears the focused field.
+                sendKey(KeyEvent.KEYCODE_A, KeyEvent.META_CTRL_ON)
+                sendKey(KeyEvent.KEYCODE_FORWARD_DEL)
             }
-            override fun clear() { ic()?.deleteSurroundingText(100000, 100000) }
-            override fun moveCaret(delta: Int) { /* not wired for gecko yet */ }
+            override fun moveCaret(delta: Int) {
+                sendKey(if (delta < 0) KeyEvent.KEYCODE_DPAD_LEFT else KeyEvent.KEYCODE_DPAD_RIGHT)
+            }
         }
         setContentView(binocular)
 
@@ -144,7 +135,7 @@ class GeckoTestActivity : Activity() {
         val groq = GroqDictation(
             context = this,
             keyProvider = { GeoPrefs.groqKey(this) },
-            onState = { rec -> runOnUiThread { binocular.setMicActive(rec) } },
+            onState = { rec -> runOnUiThread { binocular.setMicActive(rec); micService(rec) } },
             onResult = { text ->
                 runOnUiThread {
                     binocular.textInput?.commit(text)
@@ -165,16 +156,52 @@ class GeckoTestActivity : Activity() {
         binocular.onSaveGroqKey = { key -> GeoPrefs.setGroqKey(this, key) }
         binocular.currentGroqKey = { GeoPrefs.groqKey(this) }
 
+        // ── Gemini voice STT for the AI Assistant ────────────────────────
+        // Triple tap opens the assistant and starts listening; a single tap
+        // stops recording → Gemini transcribes → the transcript is typed into
+        // the assistant's prompt and submitted (Ctrl+Enter).
+        geminiDictation = GeminiDictation(
+            context = this,
+            keyProvider = { GeoPrefs.geminiKey(this) },
+            onState = { rec ->
+                runOnUiThread {
+                    binocular.setMicActive(rec)
+                    micService(rec)
+                    if (rec) binocular.showStatus("Listening… tap once to send")
+                }
+            },
+            onResult = { text ->
+                runOnUiThread {
+                    pendingQuery = text
+                    binocular.showStatus("Heard: ${text.take(40)}…")
+                    // Ask the page to focus the assistant prompt; we type on ack.
+                    runCatching { bridgePort?.postMessage(org.json.JSONObject().put("type", "focus-prompt")) }
+                }
+            },
+            onError = { msg -> runOnUiThread { binocular.showStatus("Voice: $msg") } }
+        )
+
         // Runtime receiver so the plain implicit adb broadcast also works
         // while the app is up (manifest SetKeyReceiver covers the cold case).
         keyReceiver = object : android.content.BroadcastReceiver() {
             override fun onReceive(c: Context, i: Intent) {
                 val k = i.getStringExtra("key")?.trim().orEmpty()
-                if (k.isNotBlank()) {
+                if (k.isBlank()) return
+                if (i.action == GeoPrefs.ACTION_SET_GEMINI_KEY) {
+                    GeoPrefs.setGeminiKey(this@GeckoTestActivity, k)
+                    binocular.showStatus("Gemini key set via adb (${k.length} chars)")
+                } else {
                     GeoPrefs.setGroqKey(this@GeckoTestActivity, k)
                     binocular.showStatus("Groq key set via adb (${k.length} chars)")
                 }
             }
+        }
+        runCatching {
+            androidx.core.content.ContextCompat.registerReceiver(
+                this, keyReceiver,
+                android.content.IntentFilter(GeoPrefs.ACTION_SET_GEMINI_KEY),
+                androidx.core.content.ContextCompat.RECEIVER_EXPORTED
+            )
         }
         runCatching {
             androidx.core.content.ContextCompat.registerReceiver(
@@ -184,20 +211,7 @@ class GeckoTestActivity : Activity() {
             )
         }
 
-        // Gecko drives our on-screen keyboard (not the system IME) through its
-        // text-input delegate: when a field focuses, showSoftInput fires.
-        session.textInput.setDelegate(object : GeckoSession.TextInputDelegate {
-            override fun restartInput(s: GeckoSession, reason: Int) {
-                inputConnection = null
-                if (reason == GeckoSession.TextInputDelegate.RESTART_REASON_BLUR) {
-                    runOnUiThread { binocular.hideKeyboard() }
-                }
-            }
-            override fun showSoftInput(s: GeckoSession) { runOnUiThread { binocular.showKeyboard() } }
-            override fun hideSoftInput(s: GeckoSession) { runOnUiThread { binocular.hideKeyboard() } }
-        })
-
-        // ── bridge extension: geolocation feed / right-click / icon rail ──
+        // ── bridge extension: geolocation feed / right-click / What's-here ──
         runtime.webExtensionController
             .ensureBuiltIn("resource://android/assets/geolibre-ext/", "bridge@x3geolibre.app")
             .accept({ ext ->
@@ -208,8 +222,9 @@ class GeckoTestActivity : Activity() {
                 }
             }, { e -> Log.w(TAG, "bridge ext install failed: ${e?.message}") })
 
-        // Long-press on the right pad = right-click at the cursor.
-        binocular.longPressHandler = { fx, fy ->
+        // Double tap = context menu (right-click); triple tap = GeoAgent assistant;
+        // single tap on the map = "What's here?".
+        binocular.doubleTapHandler = { fx, fy ->
             val sent = runCatching {
                 bridgePort?.postMessage(
                     org.json.JSONObject().put("type", "contextmenu")
@@ -218,9 +233,24 @@ class GeckoTestActivity : Activity() {
             }.getOrDefault(false)
             if (!sent) binocular.showStatus("Context menu unavailable (page still loading?)")
         }
+        // Triple tap toggles the hands-free Live voice conversation: it opens the
+        // AI Assistant, then reads its answers aloud and listens for your reply,
+        // looping until you tap to end.
+        binocular.tripleTapHandler = { _, _ -> toggleLive() }
+        // During a Live conversation single taps stay NORMAL clicks — GeoLibre pops
+        // a "Run assistant code?" dialog whose Run button must be clickable, and
+        // eating the tap here killed the session mid-approval (the "it stopped
+        // hearing me" bug). Ending Live is the double tap, which closes the AI
+        // window (assistant-closed → stopLive). One-shot dictation keeps tap=stop.
+        binocular.tapInterceptor = {
+            val d = geminiDictation
+            if (d != null && d.isRecording()) { d.toggle(); true } else false
+        }
 
         // The glasses' Wi-Fi takes ~5s to come up after wake — gate the first
-        // load on a validated network instead of showing a dead error page.
+        // load on a validated network instead of showing a cached shell with a
+        // permanently blank map.
+        watchForNetwork()
         loadWhenOnline()
         // Mark the session foreground so GeckoView keeps its content process at high
         // priority — otherwise Android can freeze/throttle that child process and
@@ -247,7 +277,11 @@ class GeckoTestActivity : Activity() {
             "media.getusermedia.noise_enabled" to false,
             "media.getusermedia.agc_enabled" to false,
             "media.getusermedia.hpf_enabled" to false,
-            "media.peerconnection.video.enabled" to false
+            "media.peerconnection.video.enabled" to false,
+            // Don't zoom-to-input on focus: the zoom re-layout blurs the field,
+            // which closes our on-screen keyboard before the user can type.
+            "formhelper.autozoom" to false,
+            "apz.zoom-to-focused-input.enabled" to false
         )
         prefs.forEach { (k, v) ->
             runCatching {
@@ -257,14 +291,169 @@ class GeckoTestActivity : Activity() {
         }
     }
 
-    /** Fresh-or-cached InputConnection onto GeckoView's currently focused field. */
-    private fun ic(): InputConnection? {
-        if (inputConnection == null) {
-            inputConnection = runCatching {
-                session.textInput.onCreateInputConnection(EditorInfo())
-            }.getOrNull()
+    // ── keyboard → Gecko via synthesized KeyEvents ───────────────────
+    private val keyCharacterMap: android.view.KeyCharacterMap by lazy {
+        android.view.KeyCharacterMap.load(android.view.KeyCharacterMap.VIRTUAL_KEYBOARD)
+    }
+
+    /** Type a string into the focused Gecko field as raw key events. */
+    private fun typeText(text: String) {
+        val events = keyCharacterMap.getEvents(text.toCharArray())
+        if (events != null) {
+            events.forEach { ev -> geckoView.dispatchKeyEvent(ev) }
+            return
         }
-        return inputConnection
+        // Unmappable char(s) (emoji etc.) — best-effort via the InputConnection.
+        runCatching {
+            session.textInput.onCreateInputConnection(EditorInfo())?.commitText(text, 1)
+        }
+    }
+
+    /** Press-and-release one key (optionally with meta, e.g. Ctrl+A). */
+    private fun sendKey(keyCode: Int, meta: Int = 0) {
+        val now = android.os.SystemClock.uptimeMillis()
+        geckoView.dispatchKeyEvent(KeyEvent(now, now, KeyEvent.ACTION_DOWN, keyCode, 0, meta))
+        geckoView.dispatchKeyEvent(KeyEvent(now, now, KeyEvent.ACTION_UP, keyCode, 0, meta))
+    }
+    /** Build a fully-configured (but not-yet-loaded) session. */
+    private fun newSession(runtime: org.mozilla.geckoview.GeckoRuntime): GeckoSession {
+        val settings = GeckoSessionSettings.Builder()
+            .userAgentMode(GeckoSessionSettings.USER_AGENT_MODE_DESKTOP)
+            .viewportMode(GeckoSessionSettings.VIEWPORT_MODE_DESKTOP)
+            .build()
+        val s = GeckoSession(settings)
+        s.progressDelegate = object : GeckoSession.ProgressDelegate {
+            override fun onPageStop(sess: GeckoSession, success: Boolean) { Log.d(TAG, "onPageStop success=$success") }
+        }
+        s.contentDelegate = object : GeckoSession.ContentDelegate {
+            override fun onTitleChange(sess: GeckoSession, title: String?) {
+                if (title != null && title.startsWith("WRTC|")) Log.d("X3GeoLibre-WRTC", title.removePrefix("WRTC|"))
+            }
+        }
+        s.permissionDelegate = object : GeckoSession.PermissionDelegate {
+            override fun onContentPermissionRequest(
+                sess: GeckoSession, perm: GeckoSession.PermissionDelegate.ContentPermission
+            ): org.mozilla.geckoview.GeckoResult<Int> =
+                org.mozilla.geckoview.GeckoResult.fromValue(GeckoSession.PermissionDelegate.ContentPermission.VALUE_ALLOW)
+            override fun onAndroidPermissionsRequest(
+                sess: GeckoSession, permissions: Array<out String>?, callback: GeckoSession.PermissionDelegate.Callback
+            ) { callback.grant() }
+            override fun onMediaPermissionRequest(
+                sess: GeckoSession, uri: String,
+                video: Array<out GeckoSession.PermissionDelegate.MediaSource>?,
+                audio: Array<out GeckoSession.PermissionDelegate.MediaSource>?,
+                callback: GeckoSession.PermissionDelegate.MediaCallback
+            ) { callback.grant(null, audio?.firstOrNull()) }
+        }
+        // On-screen keyboard driven by Gecko's text-input focus. A page-field blur
+        // must not pull the keyboard out from under our own open Settings panel.
+        s.textInput.setDelegate(object : GeckoSession.TextInputDelegate {
+            override fun restartInput(sess: GeckoSession, reason: Int) {
+                inputConnection = null
+                if (reason == GeckoSession.TextInputDelegate.RESTART_REASON_BLUR) {
+                    runOnUiThread { if (!binocular.isSettingsOpen()) binocular.hideKeyboard() }
+                }
+            }
+            override fun showSoftInput(sess: GeckoSession) {
+                // During a Live voice conversation all input is spoken; focusing the
+                // prompt to type the transcript would otherwise flash the on-screen
+                // keyboard for an instant. Suppress it while Live is active.
+                if (geminiLive?.isActive() == true) return
+                runOnUiThread { binocular.showKeyboard() }
+            }
+            override fun hideSoftInput(sess: GeckoSession) {
+                runOnUiThread { if (!binocular.isSettingsOpen()) binocular.hideKeyboard() }
+            }
+        })
+        s.open(runtime)
+        return s
+    }
+
+    /** Content-script port: geolocation feed, right-click, What's-here, zoom. */
+    private val portDelegate = object : WebExtension.MessageDelegate {
+        override fun onConnect(port: WebExtension.Port) {
+            bridgePort = port
+            port.setDelegate(object : WebExtension.PortDelegate {
+                override fun onPortMessage(message: Any, p: WebExtension.Port) {
+                    val obj = message as? org.json.JSONObject ?: return
+                    when (obj.optString("type")) {
+                        "ready" -> lastFix?.let { runOnUiThread { sendPosition(it) } }
+                        "probe" -> Log.i(TAG, "X3PROBE $obj")
+                        "want-position" -> {
+                            val fix = lastFix
+                            if (fix != null) runOnUiThread { sendPosition(fix) } else startIpLocate()
+                        }
+                        // GeoLibre's Radix menus only open on trusted input, so the
+                        // content script asks us to land a real GeckoView tap.
+                        "tap-native" -> {
+                            val fx = obj.optDouble("fx", 0.5).toFloat()
+                            val fy = obj.optDouble("fy", 0.5).toFloat()
+                            runOnUiThread { binocular.tapGeckoFraction(fx, fy) }
+                        }
+                        "zoom" -> {
+                            val dir = obj.optInt("dir", 1)
+                            runOnUiThread { binocular.zoomGecko(dir) }
+                        }
+                        // Assistant setup: the key input is focused — type the key.
+                        "type-gemini-key" -> runOnUiThread {
+                            typeText(GeoPrefs.geminiKey(this@GeckoTestActivity))
+                        }
+                        // Assistant open + configured. If we were opening it to
+                        // start a Live conversation, kick that off now.
+                        "assistant-ready" -> runOnUiThread {
+                            binocular.hideKeyboard()
+                            if (liveWanted) { liveWanted = false; actuallyStartLive() }
+                        }
+                        // Double tap closed the AI window — end the voice loop too.
+                        "assistant-closed" -> runOnUiThread {
+                            if (geminiLive?.isActive() == true) stopLive()
+                        }
+                        // [X3UI] voice commands that are keystrokes, not menus:
+                        // undo/redo hit GeoLibre's store history; escape dismisses
+                        // whatever dialog/menu is up. Sent natively = trusted.
+                        "ui-key" -> runOnUiThread {
+                            when (obj.optString("key")) {
+                                "undo" -> sendKey(KeyEvent.KEYCODE_Z, KeyEvent.META_CTRL_ON)
+                                "redo" -> sendKey(
+                                    KeyEvent.KEYCODE_Z,
+                                    KeyEvent.META_CTRL_ON or KeyEvent.META_SHIFT_ON
+                                )
+                                "escape" -> sendKey(KeyEvent.KEYCODE_ESCAPE)
+                            }
+                        }
+                        // Live voice: GeoLibre finished an answer — read it aloud.
+                        "assistant-response" -> runOnUiThread {
+                            val text = obj.optString("text")
+                            Log.i(TAG, "X3ANSWER len=${text.length}: ${text.take(300)}")
+                            if (text.isNotBlank()) geminiLive?.speak(text)
+                        }
+                        // Prompt focused → type the transcript and submit (Ctrl+Enter).
+                        "prompt-focused" -> runOnUiThread {
+                            val q = pendingQuery ?: return@runOnUiThread
+                            pendingQuery = null
+                            typeText(q)
+                            binocular.postDelayed({
+                                sendKey(KeyEvent.KEYCODE_ENTER, KeyEvent.META_CTRL_ON)
+                                binocular.hideKeyboard()
+                                binocular.showStatus("Query sent to AI Assistant")
+                            }, 250)
+                        }
+                        "assistant-status" -> runOnUiThread {
+                            binocular.showStatus(obj.optString("text", ""))
+                        }
+                    }
+                }
+                override fun onDisconnect(p: WebExtension.Port) {
+                    if (bridgePort == p) bridgePort = null
+                }
+            })
+            lastFix?.let { sendPosition(it) }
+            // Push the Gemini key so the page can seed GeoLibre's AI Assistant
+            // provider config (localStorage desktopSettings.aiProviderEnv).
+            runCatching {
+                port.postMessage(org.json.JSONObject().put("type", "gemini-key").put("key", GeoPrefs.geminiKey(this@GeckoTestActivity)))
+            }
+        }
     }
 
     private fun enableImmersive() {
@@ -294,15 +483,87 @@ class GeckoTestActivity : Activity() {
     }
 
     private fun releaseLocks() {
+        runCatching { if (liveWifiLock?.isHeld == true) liveWifiLock?.release() }
         runCatching { if (wifiLock?.isHeld == true) wifiLock?.release() }
         runCatching { if (wakeLock.isHeld) wakeLock.release() }
     }
 
-    private fun startPlaybackService() {
+    /**
+     * On-demand foreground microphone service: started only while a dictation is
+     * actively recording (a few seconds), stopped the instant it ends. Keeping it
+     * off the rest of the time is one of the heat fixes — it used to run for the
+     * whole session. It still guards the mic against being throttled/revoked if
+     * the display sleeps mid-recording.
+     */
+    private fun micService(on: Boolean) {
         val intent = Intent(this, GeoPlaybackService::class.java)
         runCatching {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(intent) else startService(intent)
-        }.onFailure { Log.w(TAG, "start service failed: ${it.message}") }
+            if (on) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(intent)
+                else startService(intent)
+            } else {
+                stopService(intent)
+            }
+        }.onFailure { Log.w(TAG, "mic service ${if (on) "start" else "stop"} failed: ${it.message}") }
+    }
+
+    // ── Live voice conversation ─────────────────────────────────────────────
+    /** Triple tap: start the Live loop, or end it if already running. */
+    private fun toggleLive() {
+        if (geminiLive?.isActive() == true) { stopLive(); return }
+        liveWanted = true
+        binocular.showStatus("Starting live voice…")
+        val sent = runCatching {
+            bridgePort?.postMessage(org.json.JSONObject().put("type", "ensure-assistant")) != null
+        }.getOrDefault(false)
+        if (!sent) {
+            liveWanted = false
+            binocular.showStatus("Assistant unavailable (page still loading?)")
+        }
+    }
+
+    /** Assistant panel is open — open the Live session and begin listening. */
+    private fun actuallyStartLive() {
+        geminiLive?.stop()
+        runCatching { liveWifiLock?.let { if (!it.isHeld) it.acquire() } }
+        val live = GeminiLiveSession(
+            context = this,
+            keyProvider = { GeoPrefs.geminiKey(this) },
+            onReady = {
+                runOnUiThread {
+                    micService(true)
+                    binocular.showStatus("● Live — speak (double-tap to end)")
+                    runCatching { bridgePort?.postMessage(org.json.JSONObject().put("type", "live-on")) }
+                }
+            },
+            onVoiceState = { st -> runOnUiThread { binocular.setVoiceState(st) } },
+            onUserTranscript = { text ->
+                runOnUiThread {
+                    pendingQuery = text
+                    binocular.showStatus("Heard: ${text.take(40)}")
+                    // Type + submit into GeoLibre via the existing focus→type→send path.
+                    runCatching { bridgePort?.postMessage(org.json.JSONObject().put("type", "focus-prompt")) }
+                }
+            },
+            onStatus = { text -> runOnUiThread { binocular.showStatus(text) } },
+            onClosed = { reason ->
+                runOnUiThread {
+                    micService(false)
+                    runCatching { liveWifiLock?.let { if (it.isHeld) it.release() } }
+                    binocular.setVoiceState(GeckoBinocularLayout.VoiceState.OFF)
+                    runCatching { bridgePort?.postMessage(org.json.JSONObject().put("type", "live-off")) }
+                    binocular.showStatus(if (reason != null) "Live ended: $reason" else "Live ended")
+                    geminiLive = null
+                }
+            }
+        )
+        geminiLive = live
+        live.start()
+    }
+
+    private fun stopLive() {
+        liveWanted = false
+        geminiLive?.stop()
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
@@ -311,11 +572,18 @@ class GeckoTestActivity : Activity() {
     }
 
     override fun onDestroy() {
+        runCatching { geminiLive?.stop() }
         runCatching { dictation?.cancel() }
         runCatching { keyReceiver?.let { unregisterReceiver(it) } }
         keyReceiver = null
+        ui.removeCallbacks(networkPoll)
+        networkCallback?.let { callback ->
+            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
+            runCatching { cm.unregisterNetworkCallback(callback) }
+        }
+        networkCallback = null
         releaseLocks()
-        runCatching { stopService(Intent(this, GeoPlaybackService::class.java)) }
+        micService(false)
         runCatching { session.close() }
         super.onDestroy()
     }
@@ -327,52 +595,61 @@ class GeckoTestActivity : Activity() {
     private fun isOnline(): Boolean {
         val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
         val caps = runCatching { cm.getNetworkCapabilities(cm.activeNetwork) }.getOrNull() ?: return false
-        return caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET)
+        return caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+            caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_VALIDATED)
     }
 
-    /** Poll for a network for up to ~20s (Wi-Fi needs ~5s after wake), then
-     *  load; on timeout load anyway and re-load when connectivity arrives. */
-    private fun loadWhenOnline(waitedMs: Long = 0L) {
+    /** Wait for real Internet. An offline cached shell reports a successful page
+     * load even though its MapLibre style failed, so it must never be the boot UI. */
+    private fun loadWhenOnline() {
         if (loadRequested) return
         if (isOnline()) {
             loadRequested = true
-            binocular.showStatus("Loading GeoLibre…")
+            ui.removeCallbacks(networkPoll)
+            binocular.showStatus("Loading GeoLibre…  1 tap select · 2 context · 3 tools")
             session.loadUri(HOME)
             startIpLocate()
-            watchForReconnect()
             return
         }
-        if (waitedMs == 0L) binocular.showStatus("Waiting for Wi-Fi (takes ~5s)…")
-        if (waitedMs >= 20_000L) {
-            loadRequested = true
-            binocular.showStatus("No network yet — will retry when Wi-Fi connects")
-            session.loadUri(HOME)
-            watchForReconnect()
-            return
-        }
-        ui.postDelayed({ loadWhenOnline(waitedMs + 700L) }, 700L)
+        binocular.showStatus("Waiting for Wi-Fi… map will open automatically")
+        ui.removeCallbacks(networkPoll)
+        ui.postDelayed(networkPoll, 750L)
     }
 
-    /** If the first load failed (no network), reload when a network appears. */
-    private fun watchForReconnect() {
+    /** Wake the gate as soon as Android validates the reconnected Wi-Fi. */
+    private fun watchForNetwork() {
+        if (networkCallback != null) return
         val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
-        runCatching {
-            cm.registerDefaultNetworkCallback(object : android.net.ConnectivityManager.NetworkCallback() {
-                override fun onAvailable(network: android.net.Network) {
-                    ui.post {
-                        if (!pageLoadedOk) {
-                            Log.i(TAG, "network arrived — reloading GeoLibre")
-                            binocular.showStatus("Wi-Fi connected — loading GeoLibre…")
-                            session.loadUri(HOME)
-                        }
-                        if (lastFix == null) startIpLocate()
-                    }
+        val callback = object : android.net.ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: android.net.Network) {
+                ui.post { loadWhenOnline() }
+            }
+
+            override fun onCapabilitiesChanged(
+                network: android.net.Network,
+                capabilities: android.net.NetworkCapabilities
+            ) {
+                if (capabilities.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_VALIDATED)) {
+                    ui.post { loadWhenOnline() }
                 }
-            })
+            }
+
+            override fun onLost(network: android.net.Network) {
+                if (!loadRequested) ui.post { binocular.showStatus("Waiting for Wi-Fi…") }
+            }
+        }
+        networkCallback = callback
+        runCatching {
+            cm.registerDefaultNetworkCallback(callback)
+        }.onFailure {
+            networkCallback = null
+            Log.w(TAG, "network callback failed: ${it.message}")
         }
     }
 
     private fun startIpLocate() {
+        if (ipLocateStarted) return
+        ipLocateStarted = true
         Thread({
             val fix = IpLocator.locate()
             if (fix != null) {
@@ -384,6 +661,7 @@ class GeckoTestActivity : Activity() {
                 }
             } else {
                 Log.w(TAG, "IP locate failed")
+                ipLocateStarted = false
             }
         }, "x3geo-iploc").start()
     }
@@ -398,32 +676,6 @@ class GeckoTestActivity : Activity() {
                     .put("acc", fix.accuracyM)
                     .put("label", fix.label)
             )
-        }
-    }
-
-    /** Content-script port: receives ready/want-position, feeds positions. */
-    private val portDelegate = object : WebExtension.MessageDelegate {
-        override fun onConnect(port: WebExtension.Port) {
-            Log.i(TAG, "bridge port connected")
-            bridgePort = port
-            port.setDelegate(object : WebExtension.PortDelegate {
-                override fun onPortMessage(message: Any, p: WebExtension.Port) {
-                    val obj = message as? org.json.JSONObject ?: return
-                    when (obj.optString("type")) {
-                        "ready" -> lastFix?.let { runOnUiThread { sendPosition(it) } }
-                        "probe" -> Log.i(TAG, "X3PROBE $obj")
-                        "want-position" -> {
-                            val fix = lastFix
-                            if (fix != null) runOnUiThread { sendPosition(fix) }
-                            else startIpLocate()
-                        }
-                    }
-                }
-                override fun onDisconnect(p: WebExtension.Port) {
-                    if (bridgePort == p) bridgePort = null
-                }
-            })
-            lastFix?.let { sendPosition(it) }
         }
     }
 

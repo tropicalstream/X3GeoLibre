@@ -51,6 +51,9 @@ dependencies {
     implementation("androidx.appcompat:appcompat:1.7.0")
     implementation("androidx.webkit:webkit:1.12.1")
 
+    // WebSocket client for the Gemini Live (BidiGenerateContent) voice loop.
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
+
     // Bundled modern browser engine (Firefox 152) — the X3 Pro's system WebView is
     // stuck at Chrome 95 and can't be replaced on this locked build, so we ship our
     // own engine for WASM / modern CSS / correct rendering.

@@ -7,6 +7,8 @@
     <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
 
     <!-- ChatGPT voice chat: WebRTC getUserMedia needs the mic, and it must keep
          capturing while the glasses' display sleeps (onPause), so the playback
@@ -30,12 +32,13 @@
         <!-- RayNeo Mercury launcher integration (dual projection / AR app). -->
         <meta-data android:name="com.rayneo.mercury.app" android:value="true" />
 
-        <!-- adb-pushable Groq key (see SetKeyReceiver kdoc / README). -->
+        <!-- adb-pushable Groq + Gemini keys (see SetKeyReceiver kdoc / README). -->
         <receiver
             android:name=".SetKeyReceiver"
             android:exported="true">
             <intent-filter>
                 <action android:name="com.x3geolibre.app.SET_GROQ_KEY" />
+                <action android:name="com.x3geolibre.app.SET_GEMINI_KEY" />
             </intent-filter>
         </receiver>
 
@@ -44,18 +47,22 @@
             android:exported="false"
             android:foregroundServiceType="microphone|mediaPlayback" />
 
-        <!-- Legacy Chrome-95 WebView build; kept as a fallback, launchable via
-             adb: am start -n com.x3geolibre.app/.MainActivity -->
+        <!-- System-WebView build (TapGarden dual-draw). NOT the launcher for
+             GeoLibre: Chrome 95's WASM engine can't run MapLibre GL, so the map
+             stays blank here. Kept adb-launchable for WASM-free web apps. -->
         <activity
             android:name=".MainActivity"
             android:configChanges="orientation|screenSize|keyboardHidden|screenLayout|smallestScreenSize|uiMode|density"
             android:exported="true"
             android:hardwareAccelerated="true"
             android:launchMode="singleTask"
+            android:screenOrientation="landscape"
             android:theme="@style/Theme.X3GeoLibre"
             android:windowSoftInputMode="stateAlwaysHidden|adjustNothing" />
 
-        <!-- Primary app: bundled GeckoView (Firefox 152) engine. -->
+        <!-- Primary app: bundled GeckoView (Firefox 152) — the only engine on the
+             glasses whose WASM can run GeoLibre's MapLibre map. One live view (left
+             eye) mirrored to the right eye; the cursor is drawn live in both. -->
         <activity
             android:name=".GeckoTestActivity"
             android:configChanges="orientation|screenSize|keyboardHidden|screenLayout|smallestScreenSize|uiMode|density"
@@ -68,7 +75,6 @@
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
-                <!-- RayNeo AR launcher category (mirrors TapInsight/TapLinkX3). -->
                 <category android:name="com.rayneo.intent.category.AR_APP" />
             </intent-filter>
         </activity>

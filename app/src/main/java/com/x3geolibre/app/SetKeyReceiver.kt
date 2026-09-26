@@ -12,16 +12,25 @@ import android.util.Log
  *
  *   adb shell am broadcast -n com.x3geolibre.app/.SetKeyReceiver \
  *     -a com.x3geolibre.app.SET_GROQ_KEY --es key "gsk_..."
+ *   adb shell am broadcast -n com.x3geolibre.app/.SetKeyReceiver \
+ *     -a com.x3geolibre.app.SET_GEMINI_KEY --es key "AIza..."
  */
 class SetKeyReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
-        if (intent.action != GeoPrefs.ACTION_SET_GROQ_KEY) return
         val key = intent.getStringExtra("key")?.trim().orEmpty()
         if (key.isBlank()) {
-            Log.w("X3GeoLibre", "SET_GROQ_KEY broadcast without --es key")
+            Log.w("X3GeoLibre", "${intent.action} broadcast without --es key")
             return
         }
-        GeoPrefs.setGroqKey(context, key)
-        Log.i("X3GeoLibre", "Groq key persisted from broadcast (${key.length} chars)")
+        when (intent.action) {
+            GeoPrefs.ACTION_SET_GROQ_KEY -> {
+                GeoPrefs.setGroqKey(context, key)
+                Log.i("X3GeoLibre", "Groq key persisted from broadcast (${key.length} chars)")
+            }
+            GeoPrefs.ACTION_SET_GEMINI_KEY -> {
+                GeoPrefs.setGeminiKey(context, key)
+                Log.i("X3GeoLibre", "Gemini key persisted from broadcast (${key.length} chars)")
+            }
+        }
     }
 }

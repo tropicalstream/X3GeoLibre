@@ -26,6 +26,12 @@ object Gecko {
                     // 1x cuts that cost sharply (and speeds up rendering generally).
                     .displayDensityOverride(1.0f)
                     .displayDpiOverride(160)
+                    // Force dark. GeoLibre (like most modern web apps) picks its
+                    // theme from prefers-color-scheme; the X3's GeckoView reports
+                    // "light" by default, so without this the map loads light. This
+                    // makes the media query resolve dark engine-wide, which is both
+                    // the requested default and easier on the eyes on a waveguide.
+                    .preferredColorScheme(GeckoRuntimeSettings.COLOR_SCHEME_DARK)
                     .build()
             ).also { runtime = it }
             // Autoplay is allowed per-request in the session PermissionDelegate's

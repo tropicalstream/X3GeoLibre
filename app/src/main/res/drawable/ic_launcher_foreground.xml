@@ -1,22 +1,15 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Self-contained adaptive-icon foreground: a white speech bubble on the
-     transparent foreground layer (the green launcher background shows through).
-     108x108 viewport with the standard ~18dp safe-zone padding. -->
+<!-- GeoLibre adaptive-icon foreground: a map/globe with RayNeo X3 Pro glasses
+     in the foreground. Keep the artwork inside the adaptive-icon safe zone. -->
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
     android:width="108dp"
     android:height="108dp"
     android:viewportWidth="108"
     android:viewportHeight="108">
-    <path
-        android:fillColor="#FFFFFFFF"
-        android:pathData="M34,30h40c5.52,0 10,4.48 10,10v22c0,5.52 -4.48,10 -10,10H52l-14,12v-12h-4c-5.52,0 -10,-4.48 -10,-10V40c0,-5.52 4.48,-10 10,-10z" />
-    <path
-        android:fillColor="#10A37F"
-        android:pathData="M42,49m-3.5,0a3.5,3.5 0,1 1,7 0a3.5,3.5 0,1 1,-7 0" />
-    <path
-        android:fillColor="#10A37F"
-        android:pathData="M54,49m-3.5,0a3.5,3.5 0,1 1,7 0a3.5,3.5 0,1 1,-7 0" />
-    <path
-        android:fillColor="#10A37F"
-        android:pathData="M66,49m-3.5,0a3.5,3.5 0,1 1,7 0a3.5,3.5 0,1 1,-7 0" />
+    <!-- globe/map -->
+    <path android:fillColor="#FF36C7B5" android:pathData="M54,22a32,32 0,1 0,0 64a32,32 0,1 0,0 -64zM28,50h52M54,22c-9,8 -13,18 -13,32s4,24 13,32M54,22c9,8 13,18 13,32s-4,24 -13,32M33,31c6,4 13,6 21,6s15,-2 21,-6M33,77c6,-4 13,-6 21,-6s15,2 21,6z" android:strokeColor="#FFFFFFFF" android:strokeWidth="2.5" android:strokeLineCap="round" android:strokeLineJoin="round" android:fillType="evenOdd" />
+    <!-- X3 Pro glasses, deliberately in front of the map -->
+    <path android:fillColor="#FF071630" android:pathData="M22,56h10v9c0,5 4,9 9,9h8c5,0 9,-4 9,-9v-9h-8v9c0,1 -1,2 -2,2h-8c-1,0 -2,-1 -2,-2v-9H22zM59,56h8v9c0,1 -1,2 -2,2h-8c-1,0 -2,-1 -2,-2v-9h4zM67,56h9v9c0,5 -4,9 -9,9h-8c-5,0 -9,-4 -9,-9v-9h8v9c0,1 1,2 2,2h8c1,0 2,-1 2,-2z" />
+    <path android:fillColor="#FF7DE9E1" android:pathData="M28,59h16v6c0,2 -2,4 -4,4h-8c-2,0 -4,-2 -4,-4zM64,59h16v6c0,2 -2,4 -4,4h-8c-2,0 -4,-2 -4,-4z" />
+    <path android:fillColor="#FFFFC466" android:pathData="M47,58h14v4H47z" />
 </vector>

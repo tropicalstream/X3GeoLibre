@@ -6,6 +6,8 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
+import android.os.SystemClock
+import android.view.MotionEvent
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -96,6 +98,7 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
         enableImmersiveFullscreen()
 
         if (!hasAudioPermission()) requestAudioPermission()
+        if (!hasLocationPermission()) requestLocationPermission()
 
         // Persist cookies (login) across restarts. Third-party cookies are needed
         // for the OAuth/auth.openai.com hop during sign-in.
@@ -155,16 +158,47 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
                 FrameLayout.LayoutParams.MATCH_PARENT
             )
             logicalClickHandler = { x, y -> handleLogicalClick(x, y) }
-            edgePanHandler = { dx, dy -> scrollPage(dx, dy) }
-            edgePanStopHandler = { /* wheel/scroll needs no release */ }
+            edgePanHandler = { dx, dy -> panMap(dx, dy) }
+            edgePanStopHandler = { stopMapPan() }
             contentInteractionBlocked = { keyboardContainer.visibility == View.VISIBLE }
+            // Single tap on the map → GeoLibre "What's here?"; double = context
+            // menu; triple = toggle the GeoAgent AI assistant.
+            singleTapHandler = { fx, fy -> js("window.__x3WhatsHere && window.__x3WhatsHere($fx,$fy)") }
+            doubleTapHandler = { fx, fy -> js("window.__x3ContextMenu && window.__x3ContextMenu($fx,$fy)") }
+            tripleTapHandler = { _, _ -> js("window.__x3ToggleAssistant && window.__x3ToggleAssistant()") }
             addView(viewport, 0)
             setWebViewTarget(webView)
         }
         setContentView(binocular)
         enableImmersiveFullscreen()
 
-        webView.loadUrl(homeUrl)
+        // The glasses' Wi-Fi takes ~5s to come up after wake; loading GeoLibre
+        // before then gives a permanently blank page with no retry, so gate the
+        // first load on a validated connection.
+        loadWhenReady()
+    }
+
+    private var loaded = false
+    private val loadHandler = Handler(Looper.getMainLooper())
+    private var loadAttempts = 0
+    private fun loadWhenReady() {
+        if (loaded) return
+        loadAttempts++
+        // Require INTERNET; don't insist on VALIDATED (the glasses' Wi-Fi is slow
+        // to report it and sometimes never does). A too-early load is retried by
+        // onReceivedError. After ~8s, just try regardless.
+        if (isOnline() || loadAttempts > 8) {
+            loaded = true
+            Log.i(TAG, "loadWhenReady: loading GeoLibre (attempt $loadAttempts)")
+            webView.loadUrl(homeUrl)
+        } else {
+            loadHandler.postDelayed({ loadWhenReady() }, 1000)
+        }
+    }
+    private fun isOnline(): Boolean {
+        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
+        val caps = runCatching { cm.getNetworkCapabilities(cm.activeNetwork) }.getOrNull() ?: return false
+        return caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET)
     }
 
     private fun holdPlaybackResources() {
@@ -253,6 +287,12 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
         wv.addJavascriptInterface(GeoBridge(), "GeoBridge")
 
         wv.webChromeClient = object : WebChromeClient() {
+            override fun onConsoleMessage(m: android.webkit.ConsoleMessage): Boolean {
+                if (m.messageLevel() == android.webkit.ConsoleMessage.MessageLevel.ERROR) {
+                    Log.e("X3Console", "${m.message()} @${m.sourceId()}:${m.lineNumber()}")
+                }
+                return true
+            }
             override fun onPermissionRequest(request: PermissionRequest) {
                 // ChatGPT voice chat asks for the mic via getUserMedia.
                 val audio = request.resources
@@ -295,6 +335,20 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
                 return runCatching { interceptCss(url.toString(), req.requestHeaders) }.getOrNull()
             }
 
+            override fun onReceivedError(
+                view: WebView?,
+                request: WebResourceRequest?,
+                error: android.webkit.WebResourceError?
+            ) {
+                super.onReceivedError(view, request, error)
+                // Only the main-frame failing matters; retry it once the network
+                // settles (cold Wi-Fi can fail the very first attempt).
+                if (request?.isForMainFrame == true) {
+                    Log.w(TAG, "main-frame error ${error?.errorCode} ${error?.description}; will retry")
+                    loadHandler.postDelayed({ if (isOnline()) webView.loadUrl(homeUrl) }, 2000)
+                }
+            }
+
             override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
                 super.onPageStarted(view, url, favicon)
                 // Fallback for engines without DOCUMENT_START_SCRIPT (idempotent —
@@ -304,6 +358,8 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
                 injectDarkMode()
                 injectInputSupport()
                 injectDialogLayoutFix()
+                installGeolocationBridge()
+                injectBestKnownLocation()
             }
 
             override fun onPageFinished(view: WebView?, url: String?) {
@@ -312,8 +368,12 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
                 injectDarkMode()
                 injectInputSupport()
                 injectGlassesHelpers()
+                injectGeoLibre()
                 injectDialogLayoutFix()
                 injectComposerVisibilityFix()
+                installGeolocationBridge()
+                injectBestKnownLocation()
+                requestFreshLocation()
                 CookieManager.getInstance().flush()
             }
         }
@@ -399,6 +459,19 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
         @JavascriptInterface fun onInputBlur() = runOnUiThread {
             hideSystemKeyboard()
         }
+        // GeoLibre's Radix menus only open on trusted input, so the page asks us
+        // to land a REAL WebView tap at an element's centre (viewport fractions).
+        @JavascriptInterface fun tapNative(fx: Float, fy: Float) = runOnUiThread {
+            val x = (fx * webView.width).coerceIn(1f, webView.width - 1f)
+            val y = (fy * webView.height).coerceIn(1f, webView.height - 1f)
+            val t = SystemClock.uptimeMillis()
+            val down = MotionEvent.obtain(t, t, MotionEvent.ACTION_DOWN, x, y, 0)
+            webView.dispatchTouchEvent(down); down.recycle()
+            webView.postDelayed({
+                val up = MotionEvent.obtain(t, SystemClock.uptimeMillis(), MotionEvent.ACTION_UP, x, y, 0)
+                webView.dispatchTouchEvent(up); up.recycle()
+            }, 40L)
+        }
     }
 
     private fun suppressImeFor(durationMs: Long) {
@@ -454,6 +527,24 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
             try { if (!o[n]) Object.defineProperty(o, n, {value: fn, writable: true, configurable: true}); }
             catch(e) { try { if (!o[n]) o[n] = fn; } catch(_) {} }
           }
+          /* ---- 0. Basemap fallback ----
+             OpenFreeMap's vector "liberty" style request fails on the glasses
+             (CORS-preflight 405 / IP throttling) and its vector rendering is heavy
+             on this old engine, so serve MapLibre a plain OSM raster style instead
+             — that's what actually paints tiles here. Patched before any page code. */
+          try {
+            var _fetch = window.fetch && window.fetch.bind(window);
+            if (_fetch) {
+              var x3Raster = {version:8,name:'OSM (X3)',sources:{'osm':{type:'raster',tiles:['https://tile.openstreetmap.org/{z}/{x}/{y}.png'],tileSize:256,maxzoom:19,attribution:'© OpenStreetMap contributors'}},layers:[{id:'osm',type:'raster',source:'osm',minzoom:0,maxzoom:22}]};
+              window.fetch = function(input, init){
+                var url=''; try{ url = typeof input==='string'?input:(input&&input.url)||''; }catch(e){}
+                if (/^https:\/\/tiles\.openfreemap\.org\/styles\/liberty(?:[\/?#]|${'$'})/i.test(url)) {
+                  return Promise.resolve(new Response(JSON.stringify(x3Raster),{status:200,headers:{'Content-Type':'application/json','Cache-Control':'no-store'}}));
+                }
+                return _fetch(input, init);
+              };
+            }
+          } catch(e) {}
           /* ---- 1. ES2022+ polyfills (Chrome 95 baseline) ---- */
           def(Array.prototype, 'findLastIndex', function(cb, th){ for (var i=this.length-1;i>=0;i--){ if (cb.call(th, this[i], i, this)) return i; } return -1; });
           def(Array.prototype, 'findLast', function(cb, th){ for (var i=this.length-1;i>=0;i--){ if (cb.call(th, this[i], i, this)) return this[i]; } });
@@ -1107,10 +1198,199 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
     //  Cursor / gesture handlers wired into BinocularSbsLayout
     // ------------------------------------------------------------------
 
-    /** Edge-of-screen cursor scroll → scroll the conversation. */
-    private fun scrollPage(dx: Int, dy: Int) {
+    /** Edge-of-screen cursor → drag-pan the map (MapLibre pans on a pointer drag). */
+    private fun panMap(dx: Int, dy: Int) {
         if (dx == 0 && dy == 0) return
-        webView.evaluateJavascript("window.__tgptScrollBy && window.__tgptScrollBy($dx,$dy)", null)
+        webView.evaluateJavascript("window.__x3MapPan && window.__x3MapPan($dx,$dy)", null)
+    }
+    private fun stopMapPan() {
+        webView.evaluateJavascript("window.__x3MapPanStop && window.__x3MapPanStop()", null)
+    }
+
+    /**
+     * GeoLibre-on-glasses helpers, injected once per page:
+     *  - a smart click (map point → "What's here?", otherwise click the element),
+     *  - context menu at the cursor (double tap),
+     *  - GeoAgent AI-assistant toggle (triple tap),
+     *  - edge-pan via a synthetic canvas drag, zoom buttons under the layer box,
+     *  - forced dark mode.
+     * GeoLibre's menus are Radix components that only open on trusted input, so the
+     * assistant/what's-here item selection is done by asking native to land a real
+     * WebView tap at the element's centre (GeoBridge.tapNative).
+     */
+    private fun injectGeoLibre() {
+        val js = """
+            (function(){
+              if(window.__x3geo) return; window.__x3geo=true;
+              function vis(el){ if(!el||!el.getClientRects||!el.getClientRects().length) return false; var s=getComputedStyle(el); return s.visibility!=='hidden'&&s.display!=='none'&&el.offsetWidth>0; }
+              function css(){ var s=document.getElementById('x3-css'); if(s||!document.documentElement) return; s=document.createElement('style'); s.id='x3-css';
+                s.textContent='.maplibregl-ctrl-group button{width:42px!important;height:42px!important}.maplibregl-ctrl button .maplibregl-ctrl-icon{background-size:25px 25px!important}.maplibregl-ctrl-fullscreen{display:none!important}.maplibregl-ctrl-group:has(.maplibregl-ctrl-fullscreen){display:none!important}';
+                document.documentElement.appendChild(s); }
+              function dark(){ var el=document.documentElement; if(el){ if(!el.classList.contains('dark'))el.classList.add('dark'); el.classList.remove('light'); el.style.colorScheme='dark'; } }
+              css(); dark();
+              try{ new MutationObserver(dark).observe(document.documentElement,{attributes:true,attributeFilter:['class']}); }catch(e){}
+
+              // fraction → the native side taps the WebView there (trusted)
+              function nativeTap(el){ if(!el) return; var r=el.getBoundingClientRect(); var fx=(r.left+r.width/2)/(window.innerWidth||1), fy=(r.top+r.height/2)/(window.innerHeight||1); try{ GeoBridge.tapNative(fx,fy); }catch(e){} }
+              function menuItem(rx){ var it=document.querySelectorAll('[role="menuitem"],[role="menuitemcheckbox"]'); for(var i=0;i<it.length;i++){ if(rx.test((it[i].textContent||'').trim())&&vis(it[i])) return it[i]; } return null; }
+              function waitFor(fn,tries,cb){ var n=0; var iv=setInterval(function(){ n++; var el=fn(); if(el){clearInterval(iv);cb(el);} else if(n>=tries){clearInterval(iv);cb(null);} },150); }
+
+              function fireContextMenu(fx,fy){ var x=Math.round((fx||0.5)*window.innerWidth), y=Math.round((fy||0.5)*window.innerHeight); var el=document.elementFromPoint(x,y)||document.body; var b={bubbles:true,cancelable:true,view:window,clientX:x,clientY:y,screenX:x,screenY:y,button:2,buttons:2}; try{ if(typeof PointerEvent!=='undefined')el.dispatchEvent(new PointerEvent('pointerdown',Object.assign({pointerId:7,pointerType:'mouse',isPrimary:true},b))); el.dispatchEvent(new MouseEvent('mousedown',b)); if(typeof PointerEvent!=='undefined')el.dispatchEvent(new PointerEvent('pointerup',Object.assign({pointerId:7,pointerType:'mouse',isPrimary:true},b,{buttons:0}))); el.dispatchEvent(new MouseEvent('mouseup',Object.assign({},b,{buttons:0}))); el.dispatchEvent(new MouseEvent('contextmenu',b)); }catch(e){} }
+
+              window.__x3ContextMenu=function(fx,fy){ fireContextMenu(fx,fy); };
+              window.__x3WhatsHere=function(fx,fy){
+                var x=(fx||0)*window.innerWidth, y=(fy||0)*window.innerHeight;
+                var el=document.elementFromPoint(x,y);
+                if(!el||!el.closest('.maplibregl-canvas')||el.closest('.maplibregl-ctrl,.maplibregl-popup,[role="menu"],[role="dialog"],aside')){ return; }
+                fireContextMenu(fx,fy);
+                waitFor(function(){ return menuItem(/what.?s here/i); },12,function(it){ if(it) nativeTap(it); });
+              };
+              // Smart click for single tap: click UI element, or "What's here?" on the map.
+              window.__x3ClickAt=function(x,y,vw,vh){
+                if(vw>0&&vh>0&&window.innerWidth>0){ x=Math.round(x*(window.innerWidth/vw)); y=Math.round(y*(window.innerHeight/vh)); }
+                var el=document.elementFromPoint(x,y); if(!el) return false;
+                if(el.closest('.maplibregl-canvas') && !el.closest('.maplibregl-ctrl,.maplibregl-popup,[role="menu"],[role="dialog"],aside')){
+                  window.__x3WhatsHere(x/window.innerWidth, y/window.innerHeight); return true;
+                }
+                var act=el.closest?el.closest('button,a,[role="button"],[role="menuitem"],[role="option"],[role="tab"],input,textarea,select,summary,label'):null;
+                var b={bubbles:true,cancelable:true,view:window,clientX:x,clientY:y,screenX:x,screenY:y,button:0};
+                function P(t,bt){ if(typeof PointerEvent!=='undefined'){try{el.dispatchEvent(new PointerEvent(t,Object.assign({pointerId:1,pointerType:'mouse',isPrimary:true,buttons:bt},b)));}catch(e){}} }
+                function M(t,bt){ try{el.dispatchEvent(new MouseEvent(t,Object.assign({buttons:bt},b)));}catch(e){} }
+                P('pointerover',1);M('mouseover',1);P('pointerdown',1);M('mousedown',1);P('pointerup',0);M('mouseup',0);
+                var field=act&&((act.tagName==='INPUT'&&act.type!=='button'&&act.type!=='submit')||act.tagName==='TEXTAREA'||act.isContentEditable);
+                if(field){ try{act.focus();}catch(e){} M('click',0); } else if(act&&act.click){ try{act.click();}catch(e){} } else { M('click',0); }
+                return true;
+              };
+
+              // GeoAgent assistant: toggle if mounted, else Plugins ▸ GeoAgent ▸ Activate.
+              var HDR='button[aria-label="GeoAgent + Earth Engine"]';
+              window.__x3ToggleAssistant=function(){
+                var h=document.querySelector(HDR);
+                if(h){ if(h.getAttribute('aria-expanded')==='true'){ nativeTap(document.querySelector('button[aria-label="Close" i]')||h); } else { nativeTap(h); } return; }
+                var plugins=document.querySelector('button[aria-label="Plugins"]'); if(!plugins) return;
+                nativeTap(plugins);
+                waitFor(function(){ return menuItem(/^GeoAgent$/); },14,function(ga){ if(!ga) return; nativeTap(ga);
+                  waitFor(function(){ return menuItem(/^Activate$/); },14,function(a){ if(a) nativeTap(a); }); });
+              };
+
+              // Edge-pan: synthetic pointer drag on the map canvas.
+              window.__x3pan={active:false,t:null,x:0,y:0};
+              function panTarget(){ return document.querySelector('.maplibregl-canvas')||document.querySelector('canvas')||document.body; }
+              function pev(t,ty,x,y,bt){ if(typeof PointerEvent!=='undefined')t.dispatchEvent(new PointerEvent(ty,{bubbles:true,cancelable:true,view:window,pointerId:9,pointerType:'mouse',isPrimary:true,clientX:x,clientY:y,button:0,buttons:bt})); }
+              function mev(t,ty,x,y,bt){ t.dispatchEvent(new MouseEvent(ty,{bubbles:true,cancelable:true,view:window,clientX:x,clientY:y,button:0,buttons:bt})); }
+              window.__x3MapPan=function(dx,dy){ var w=window.innerWidth||640,hh=window.innerHeight||480; var st=window.__x3pan;
+                if(!st.active){ st.active=true; st.t=panTarget(); st.x=Math.round(w*0.5); st.y=Math.round(hh*0.5); pev(st.t,'pointerdown',st.x,st.y,1); mev(st.t,'mousedown',st.x,st.y,1); }
+                st.x=Math.max(8,Math.min(w-8,st.x-dx)); st.y=Math.max(8,Math.min(hh-8,st.y-dy));
+                pev(st.t,'pointermove',st.x,st.y,1); mev(st.t,'mousemove',st.x,st.y,1); };
+              window.__x3MapPanStop=function(){ var st=window.__x3pan; if(!st.active) return; pev(st.t||document.body,'pointerup',st.x,st.y,0); mev(st.t||document.body,'mouseup',st.x,st.y,0); st.active=false; st.t=null; };
+
+              // Zoom buttons under the Layer Control box, styled like the built-ins.
+              function zoomBtn(id,cls,label,dir){ var g=document.createElement('div'); g.id=id+'-g'; g.className='maplibregl-ctrl maplibregl-ctrl-group';
+                var b=document.createElement('button'); b.id=id; b.className=cls; b.type='button'; b.setAttribute('aria-label',label); b.title=label;
+                var i=document.createElement('span'); i.className='maplibregl-ctrl-icon'; i.setAttribute('aria-hidden','true'); b.appendChild(i);
+                b.addEventListener('click',function(e){ e.preventDefault(); e.stopPropagation(); var c=panTarget(); var x=Math.round((window.innerWidth||640)*0.5), y=Math.round((window.innerHeight||480)*0.5);
+                  try{ c.dispatchEvent(new WheelEvent('wheel',{bubbles:true,cancelable:true,clientX:x,clientY:y,deltaY:dir<0?-240:240,deltaMode:0})); }catch(_){}}); g.appendChild(b); return g; }
+              function ensureZoom(){ var corner=document.querySelector('.maplibregl-ctrl-top-right'); if(!corner) return; var lc=corner.querySelector('.maplibregl-ctrl-layer-control'); if(!lc) return;
+                var zi=document.getElementById('x3-zin-g'), zo=document.getElementById('x3-zout-g');
+                if(!zi) zi=zoomBtn('x3-zin','maplibregl-ctrl-zoom-in','Zoom in',1); if(!zo) zo=zoomBtn('x3-zout','maplibregl-ctrl-zoom-out','Zoom out',-1);
+                if(lc.nextElementSibling!==zi) lc.insertAdjacentElement('afterend',zi); if(zi.nextElementSibling!==zo) zi.insertAdjacentElement('afterend',zo); }
+              try{ new MutationObserver(function(){ ensureZoom(); css(); }).observe(document.documentElement,{childList:true,subtree:true}); }catch(e){}
+              ensureZoom();
+
+              // Center on the user once a position arrives (GeoLibre has no locate
+              // control; fly the map if we can reach it, else geocode the point).
+              window.__x3CenterOn=function(lat,lon){
+                window.__injectedPosition={coords:{latitude:lat,longitude:lon,accuracy:50},timestamp:Date.now()};
+                try{ window.dispatchEvent(new CustomEvent('x3-location',{detail:window.__injectedPosition})); }catch(e){}
+                var tries=0; var iv=setInterval(function(){ tries++;
+                  var m=window.__x3map; if(!m){ var c=document.querySelector('.maplibregl-canvas'); var box=c&&c.closest('.maplibregl-map');
+                    // scan globals for the maplibre map
+                    for(var k in window){ try{ var v=window[k]; if(v&&typeof v.flyTo==='function'&&typeof v.getZoom==='function'){ m=window.__x3map=v; break; } }catch(e){} } }
+                  if(m){ clearInterval(iv); try{ m.flyTo({center:[lon,lat],zoom:13,duration:0}); }catch(e){} }
+                  else if(tries>=20){ clearInterval(iv); } },300);
+              };
+            })();
+        """.trimIndent()
+        runCatching { webView.evaluateJavascript(js, null) }
+    }
+
+    // ── geolocation → center on the user ────────────────────────────
+    private fun installGeolocationBridge() {
+        val js = """
+            (function(){ if(window.__x3geoInstalled) return; window.__x3geoInstalled=true;
+              function wait(s,e){ if(window.__injectedPosition){ setTimeout(function(){s(window.__injectedPosition);},10); return; }
+                var done=false; function fin(p){ if(done)return; done=true; window.removeEventListener('x3-location',on); s(p||window.__injectedPosition); }
+                function on(ev){ fin(ev&&ev.detail); } window.addEventListener('x3-location',on);
+                setTimeout(function(){ if(done)return; window.removeEventListener('x3-location',on); if(window.__injectedPosition)fin(window.__injectedPosition); else if(e)e({code:2,message:'unavailable'}); },8000); }
+              if(navigator.permissions){ var oq=navigator.permissions.query.bind(navigator.permissions); navigator.permissions.query=function(p){ if(p&&p.name==='geolocation')return Promise.resolve({state:'granted',onchange:null}); return oq(p); }; }
+              var m={ getCurrentPosition:function(s,e){ wait(s,e); }, watchPosition:function(s,e){ wait(s,e); return 1; }, clearWatch:function(){} };
+              try{ Object.defineProperty(navigator,'geolocation',{value:m,configurable:true}); }catch(e){}
+            })();
+        """.trimIndent()
+        runCatching { webView.evaluateJavascript(js, null) }
+    }
+    private fun injectBestKnownLocation() { installGeolocationBridge(); bestKnownLocation()?.let { injectLocation(it) } }
+    private fun injectLocation(loc: android.location.Location) {
+        runCatching {
+            webView.evaluateJavascript("window.__x3CenterOn && window.__x3CenterOn(${loc.latitude},${loc.longitude})", null)
+        }
+    }
+    @android.annotation.SuppressLint("MissingPermission")
+    private fun bestKnownLocation(): android.location.Location? {
+        if (!hasLocationPermission()) return null
+        val lm = getSystemService(Context.LOCATION_SERVICE) as? android.location.LocationManager ?: return null
+        var best: android.location.Location? = null
+        for (p in locationProviders(lm)) {
+            val loc = runCatching { lm.getLastKnownLocation(p) }.getOrNull() ?: continue
+            if (best == null || loc.time > best!!.time) best = loc
+        }
+        return best
+    }
+    private fun locationProviders(lm: android.location.LocationManager): List<String> =
+        listOf(
+            android.location.LocationManager.FUSED_PROVIDER,
+            android.location.LocationManager.GPS_PROVIDER,
+            android.location.LocationManager.NETWORK_PROVIDER,
+            android.location.LocationManager.PASSIVE_PROVIDER
+        ).filter { runCatching { lm.allProviders.contains(it) && lm.isProviderEnabled(it) }.getOrDefault(false) }
+    @android.annotation.SuppressLint("MissingPermission")
+    private fun requestFreshLocation() {
+        if (!hasLocationPermission()) return
+        val lm = getSystemService(Context.LOCATION_SERVICE) as? android.location.LocationManager ?: return
+        val providers = locationProviders(lm)
+        if (providers.isEmpty()) { startIpFallbackLocate(); return }
+        val listener = object : android.location.LocationListener {
+            override fun onLocationChanged(location: android.location.Location) {
+                injectLocation(location); runCatching { lm.removeUpdates(this) }
+            }
+            @Deprecated("Deprecated in Java")
+            override fun onStatusChanged(p: String?, s: Int, e: Bundle?) = Unit
+            override fun onProviderEnabled(p: String) = Unit
+            override fun onProviderDisabled(p: String) = Unit
+        }
+        providers.forEach { runCatching { lm.requestSingleUpdate(it, listener, mainLooper) } }
+    }
+    /** No device fix? fall back to IP city-level so the map still centers. */
+    private fun startIpFallbackLocate() {
+        Thread {
+            val fix = runCatching { IpLocator.locate() }.getOrNull() ?: return@Thread
+            runOnUiThread {
+                webView.evaluateJavascript("window.__x3CenterOn && window.__x3CenterOn(${fix.lat},${fix.lon})", null)
+            }
+        }.start()
+    }
+    private fun hasLocationPermission(): Boolean =
+        ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED ||
+            ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
+    private fun requestLocationPermission() {
+        if (hasLocationPermission()) return
+        runCatching {
+            ActivityCompat.requestPermissions(
+                this,
+                arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION),
+                4002
+            )
+        }
     }
 
     // ------------------------------------------------------------------
@@ -1168,9 +1448,9 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
         val vw = webView.width
         val vh = webView.height
         Log.d(TAG, "jsClickAt xi=$xi yi=$yi view=${vw}x$vh")
-        webView.evaluateJavascript("window.__tgptClickAt && window.__tgptClickAt($xi,$yi,$vw,$vh)") { result ->
-            Log.d(TAG, "jsClickAt result=$result")
-        }
+        webView.evaluateJavascript(
+            "window.__x3ClickAt?window.__x3ClickAt($xi,$yi,$vw,$vh):(window.__tgptClickAt&&window.__tgptClickAt($xi,$yi,$vw,$vh))"
+        ) { result -> Log.d(TAG, "jsClickAt result=$result") }
     }
 
     private fun js(expr: String) = runCatching {
