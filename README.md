@@ -19,7 +19,7 @@ X3 GeoLibre is a native shell that makes GeoLibre Web, an open-source cloud GIS 
 
 ## Download
 
-[X3GeoLibre.apk](X3GeoLibre.apk)
+The debug APK is published as a GitHub release asset (too large for the repo itself): [X3GeoLibre.apk](https://github.com/tropicalstream/X3GeoLibre/releases/download/v1.0/X3GeoLibre.apk)
 
 ## Credits
 
